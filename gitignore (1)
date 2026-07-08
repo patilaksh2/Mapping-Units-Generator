@@ -1,0 +1,36 @@
+# Shapefiles and other GIS data (typically large, sometimes sensitive/licensed —
+# keep survey data out of version control unless you specifically want it public)
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.sbn
+*.sbx
+*.qix
+*.gpkg
+
+# QGIS project/temp files
+*.qgz~
+*.qgs~
+.qgis.conf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local config if you split paths out of the script
+config.py
+.env

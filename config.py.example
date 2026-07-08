@@ -1,0 +1,21 @@
+# Copy this file to config.py (already excluded by .gitignore) and fill in
+# your own real paths and field names. Then import from it at the top of
+# mu_generator.py instead of hardcoding paths in the script, e.g.:
+#
+#     from config import *
+
+SOIL_LAYER    = r"./data/prefieldpoly.shp"
+PHYSIO_LAYER  = r"./data/physiography.shp"
+GEOLOGY_LAYER = r"./data/geology.shp"
+OUTPUT_SHP    = r"./output/MappingUnit_Output.shp"
+
+GROUND_TRUTH_POINT_LAYERS = [
+    # r"./data/field_points_2026.shp",
+]
+
+PHYSIO_NAME_FLD  = "legend_sho"
+GEOLOGY_NAME_FLD = "lithologic"
+EXISTING_MU_FLD  = "MU"
+POINT_MU_FLD     = "MU"
+
+TARGET_CRS = "EPSG:32643"
