@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [v10] — 2026-10-20 — SLUSI two-stage driver method
+- Assignment restructured into the SLUSI two-stage driver hierarchy. **Stage 1 (primary drivers — geology, physiography, depth)** confirms the soil series: a series-evidence table is built from the already-mapped polygons (per series: observed geology/physiography values, depth-class distribution, support, modal MU components overall and per physiography), and an unmapped polygon's candidate series must match its geology AND physiography. Candidates are ranked by depth agreement, then classifier probability, then support.
+- The classifier now works within the evidence: its top series is accepted (`ml_classifier`) only when it is among the candidates; otherwise the top-ranked candidate wins as `primary_driver_match` (confidence = 50 + 30 × depth-agreement share + 20 × relative support) and the polygon is flagged "series set by primary-driver evidence over classifier". With no candidates (unseen geology/physiography combination), the previous fall-through order is preserved: classifier alone above `CLASSIFIER_CONF_MIN` → keyword rules → nearest mapped polygon → flagged `UNK`.
+- **Stage 2 (secondary drivers)** completes the mapping unit for every Stage-1 assignment (`primary_driver_match`, `ml_classifier`, `rule_based`, `nearest_neighbor`): DepthNum/SurTexCode/SlopeCode/ErosionNum are filled with the series' modal component values (same-physiography polygons preferred, series-wide modal as fallback) and `MU_New` is assembled as the full Series+Depth+Texture+Slope+Erosion code — predicted polygons no longer carry a bare series code. Components with no modal value anywhere stay blank and are flagged `MU incomplete: <component> unknown`; nothing is invented.
+- New optional configuration: `DEPTH_FLD` (soil-layer field with a known depth class per polygon — feeds Stage 1 depth agreement and supplies the Stage 2 depth) and `SLOPE_FLD` (soil-layer slope-code field — overrides the Stage 2 modal slope). Empty (the default) disables each.
+- Tier 0 (IDW ground truth) unchanged and still the highest authority; surveyor-verified polygons unchanged. Added `tests/test_series_evidence.py` covering single-candidate matching, depth-agreement tie-breaking, the empty-candidate case, the confidence formula and Stage 2 completion.
+
 ## [v9] — 2026-10-20 — Review fixes
 - Renamed the misnamed ` (1)` files (`README (1).md`, `LICENSE (1)`, `gitignore (1)`, etc.) to their proper names so GitHub/git actually recognise them; filled in the LICENSE copyright name.
 - Fixed the spatial joins silently duplicating polygons: `native:joinattributesbylocation` now uses METHOD 2 (largest overlap) instead of 0 (one-to-many).

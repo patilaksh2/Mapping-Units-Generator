@@ -2,13 +2,19 @@
 Soil Mapping Unit (MU) Generator
 =================================
 QGIS Python console script that fills in blank Mapping Unit (MU) codes on a
-soil survey polygon layer using a hybrid pipeline:
+soil survey polygon layer, following the SLUSI two-stage driver method:
 
     Tier 0 : IDW interpolation from ground-truth points   (highest authority)
-    Tier 1 : trained classifier (Random Forest, or k-NN fallback)
-    Tier 2 : rule-based physiography/geology keyword matching
-    Tier 3 : nearest already-mapped polygon
-    Tier 4 : flagged default (last resort)
+    Stage 1: confirm the soil SERIES from the PRIMARY drivers (geology,
+             physiography, depth) - a series-evidence table built from the
+             already-mapped polygons; the trained classifier (Random
+             Forest, or k-NN fallback) works within that evidence
+    Stage 2: complete the MAPPING UNIT from the SECONDARY drivers (surface
+             texture, slope, erosion) using the series' modal components
+
+    Fallbacks when Stage 1 finds no primary-driver evidence, in order:
+    classifier alone, rule-based keyword matching, nearest mapped
+    polygon, flagged default.
 
 Must be run from inside QGIS: Plugins -> Python Console -> Show Editor ->
 paste this file -> Run.
@@ -78,6 +84,12 @@ PHYSIO_NAME_FLD  = "legend_sho"   # name/legend field on the physiography layer
 GEOLOGY_NAME_FLD = "lithologic"   # lithology field on the geology layer
 EXISTING_MU_FLD  = "MU"           # field on the soil layer holding known MU codes
 POINT_MU_FLD     = "MU"           # field on the ground-truth points holding MU codes
+DEPTH_FLD        = ""             # OPTIONAL: field on the SOIL layer holding a known
+                                  # depth class per polygon (a primary driver - feeds
+                                  # Stage 1 depth agreement and Stage 2). "" = disabled.
+SLOPE_FLD        = ""             # OPTIONAL: field on the SOIL layer holding a slope
+                                  # code per polygon (used by Stage 2 before the
+                                  # series' modal slope). "" = disabled.
 
 # ---- CRS ------------------------------------------------------------------
 # Set this to the correct UTM zone (or other projected CRS) for your study
@@ -154,6 +166,20 @@ def safe_str(value, max_len):
         return ""
     s = str(value)
     return s[:max_len] if len(s) > max_len else s
+
+
+def optional_field_value(feat, field_name):
+    """Value of an optional config field (DEPTH_FLD / SLOPE_FLD) on a
+    feature, as a clean string; "" when the field is unconfigured, absent
+    from the layer, or empty for this feature."""
+    if not field_name or field_name not in feat.fields().names():
+        return ""
+    val = feat[field_name]
+    if val is None:
+        return ""
+    if isinstance(val, float) and val.is_integer():
+        val = int(val)
+    return str(val).strip()
 
 
 # ---- Step 0: geometry fix + CRS alignment ----------------------------------
@@ -241,6 +267,214 @@ def build_training_set(layer, existing_mu_fld, non_soil_codes):
         })
         labels.append(comps["SeriesCode"])
     return rows, labels
+
+
+def build_evidence_rows(layer, existing_mu_fld, non_soil_codes):
+    """One evidence dict per already-mapped polygon (see
+    build_series_evidence for the dict shape)."""
+    rows = []
+    field_names = layer.fields().names()
+    for feat in layer.getFeatures():
+        mu = feat[existing_mu_fld]
+        if not mu or str(mu).strip().upper() in non_soil_codes:
+            continue
+        comps = decompose_mu(mu)
+        if not comps:
+            continue
+        rows.append({
+            "series": comps["SeriesCode"],
+            "geology": (feat[GEOLOGY_NAME_FLD]
+                        if GEOLOGY_NAME_FLD in field_names else "") or "",
+            "physiography": (feat[PHYSIO_NAME_FLD]
+                             if PHYSIO_NAME_FLD in field_names else "") or "",
+            "depth": comps["DepthNum"],
+            "surtex": comps["SurTexCode"],
+            "slope": comps["SlopeCode"],
+            "erosion": comps["ErosionNum"],
+        })
+    return rows
+
+
+# ---- Series-evidence table: the SLUSI two-stage core -----------------------
+# Stage 1 confirms the soil SERIES from the primary drivers (geology,
+# physiography, depth); Stage 2 completes the MAPPING UNIT from the
+# secondary drivers (surface texture, slope, erosion). The functions in
+# this section are pure (plain dicts/lists in and out, no QGIS objects)
+# so they can be unit-tested outside QGIS - see tests/test_series_evidence.py.
+
+def _modal_value(counter):
+    """Most frequent key of a Counter; ties break on the value itself so
+    results are deterministic. None for an empty counter."""
+    if not counter:
+        return None
+    return sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+
+
+def build_series_evidence(evidence_rows):
+    """
+    Build the series-evidence table used by Stage 1 and Stage 2.
+
+    Pure function: `evidence_rows` is a list of dicts with keys
+    series / geology / physiography / depth / surtex / slope / erosion
+    (one dict per already-mapped polygon, components from decompose_mu).
+    Returns {series: {...}} holding the geology value set, the
+    physiography value set, the depth-class Counter, the support
+    (polygon count), the modal depth class, and the modal MU components
+    overall and per physiography.
+    """
+    acc = {}
+    for row in evidence_rows:
+        entry = acc.setdefault(row["series"], {
+            "geologies": set(),
+            "physiographies": set(),
+            "support": 0,
+            "depth_counts": Counter(),
+            "_comp_all": defaultdict(Counter),
+            "_comp_physio": defaultdict(lambda: defaultdict(Counter)),
+        })
+        entry["geologies"].add(row["geology"])
+        entry["physiographies"].add(row["physiography"])
+        entry["support"] += 1
+        entry["depth_counts"][row["depth"]] += 1
+        for key, comp in (("depth", "DepthNum"), ("surtex", "SurTexCode"),
+                          ("slope", "SlopeCode"), ("erosion", "ErosionNum")):
+            entry["_comp_all"][comp][row[key]] += 1
+            entry["_comp_physio"][row["physiography"]][comp][row[key]] += 1
+
+    evidence = {}
+    for series, entry in acc.items():
+        evidence[series] = {
+            "geologies": entry["geologies"],
+            "physiographies": entry["physiographies"],
+            "support": entry["support"],
+            "depth_counts": entry["depth_counts"],
+            "depth_modal": _modal_value(entry["depth_counts"]),
+            "components": {comp: _modal_value(counter)
+                           for comp, counter in entry["_comp_all"].items()},
+            "components_by_physio": {
+                physio: {comp: _modal_value(counter)
+                         for comp, counter in comps.items()}
+                for physio, comps in entry["_comp_physio"].items()
+            },
+        }
+    return evidence
+
+
+def rank_series_candidates(evidence, geology, physiography,
+                           known_depth=None, classifier_probs=None):
+    """
+    Stage 1 candidate ranking (pure function).
+
+    Candidates are the series whose observed geology set contains
+    `geology` AND whose observed physiography set contains
+    `physiography`. Ranked by, in order:
+      1. depth agreement - if `known_depth` is given, the share of the
+         candidate's mapped polygons carrying that depth class;
+         otherwise the share carrying the candidate's modal depth class;
+      2. classifier probability for the series (`classifier_probs` maps
+         series -> probability %; a series missing from it counts as -1);
+      3. support (number of mapped polygons);
+      4. series code, ascending (deterministic tie-break).
+    Returns a list of candidate dicts, best first; empty when no series
+    matches both primary drivers.
+    """
+    probs = classifier_probs or {}
+    candidates = []
+    for series, entry in evidence.items():
+        if geology not in entry["geologies"]:
+            continue
+        if physiography not in entry["physiographies"]:
+            continue
+        support = entry["support"]
+        if known_depth:
+            agreed_depth = known_depth
+        else:
+            agreed_depth = entry["depth_modal"]
+        depth_agreement = (entry["depth_counts"].get(agreed_depth, 0) / support
+                           if support else 0.0)
+        candidates.append({
+            "series": series,
+            "depth_agreement": depth_agreement,
+            "agreed_depth": agreed_depth,
+            "modal_depth": entry["depth_modal"],
+            "classifier_prob": probs.get(series),
+            "support": support,
+        })
+    candidates.sort(key=lambda c: (
+        -c["depth_agreement"],
+        -(c["classifier_prob"] if c["classifier_prob"] is not None else -1.0),
+        -c["support"],
+        c["series"],
+    ))
+    return candidates
+
+
+def primary_driver_confidence(depth_agreement, support, total_support):
+    """
+    Confidence (%) for a primary_driver_match assignment:
+
+        50 + 30 * depth-agreement share + 20 * relative support
+
+    where relative support = the candidate's polygon count / the total
+    mapped-polygon count across all series. Clamped to 0-100. The base
+    50 reflects that both primary drivers (geology + physiography)
+    already matched exactly; depth agreement and prevalence refine it.
+    """
+    relative_support = (support / total_support) if total_support else 0.0
+    score = 50.0 + 30.0 * depth_agreement + 20.0 * relative_support
+    return max(0.0, min(100.0, score))
+
+
+def complete_mu_components(entry, physiography, depth_num=None, slope_code=None):
+    """
+    Stage 2 component completion (pure function).
+
+    `entry` is one series' evidence-table entry (or None when the series
+    has no mapped polygons). Modal component values are taken from the
+    series' polygons in the SAME physiography first, falling back to the
+    series-wide modal values. `depth_num` (the polygon's agreed depth,
+    e.g. from DEPTH_FLD) and `slope_code` (from SLOPE_FLD) override the
+    modal values when provided. Returns (components, missing):
+    components maps DepthNum / SurTexCode / SlopeCode / ErosionNum to a
+    value ("" when unknown) and `missing` lists the components left
+    blank - values are never invented.
+    """
+    overall = entry["components"] if entry else {}
+    by_physio = (entry["components_by_physio"].get(physiography, {})
+                 if entry else {})
+    comps = {}
+    for comp in ("DepthNum", "SurTexCode", "SlopeCode", "ErosionNum"):
+        comps[comp] = by_physio.get(comp) or overall.get(comp) or ""
+    if depth_num:
+        comps["DepthNum"] = depth_num
+    if slope_code:
+        comps["SlopeCode"] = slope_code
+    missing = [comp for comp, val in comps.items() if not val]
+    return comps, missing
+
+
+def assemble_mu_code(series, comps):
+    """Join series + components into the SLUSI-format MU code. Blank
+    components contribute nothing (they are reported via MU_Flag)."""
+    return (series + comps.get("DepthNum", "") + comps.get("SurTexCode", "")
+            + comps.get("SlopeCode", "") + comps.get("ErosionNum", ""))
+
+
+def apply_stage2(evidence, series, physiography, known_depth="", slope_code=""):
+    """
+    Stage 2: complete the mapping unit for a series assigned in Stage 1.
+    Returns (components dict including SeriesCode, assembled MU code,
+    incomplete-components note, "" when the MU is complete).
+    """
+    comp_vals, missing = complete_mu_components(
+        evidence.get(series), physiography,
+        depth_num=known_depth or None, slope_code=slope_code or None)
+    comps = {"SeriesCode": series}
+    comps.update(comp_vals)
+    note = ""
+    if missing:
+        note = "MU incomplete: " + ", ".join(missing) + " unknown"
+    return comps, assemble_mu_code(series, comp_vals), note
 
 
 # ---- Feature encoding for the classifier -----------------------------------
@@ -340,21 +574,28 @@ def train_classifier(rows, labels):
         return ("knn", (X, y), physio_vocab, geology_vocab, coord_stats)
 
 
-def classify_knn(point_vec, training_X, training_y, k):
+def classify_knn_probabilities(point_vec, training_X, training_y, k):
+    """Distance-weighted k-NN class distribution: {label: probability %}."""
     dists = []
     for i, xv in enumerate(training_X):
         d = math.sqrt(sum((a - b) ** 2 for a, b in zip(point_vec, xv)))
         dists.append((d, training_y[i]))
     dists.sort(key=lambda t: t[0])
-    nearest = dists[:k]
     weights = defaultdict(float)
-    for d, label in nearest:
-        w = 1.0 / (d + 1e-6)
-        weights[label] += w
+    for d, label in dists[:k]:
+        weights[label] += 1.0 / (d + 1e-6)
     total = sum(weights.values())
-    best_label = max(weights, key=weights.get)
-    confidence = (weights[best_label] / total) * 100 if total else 0.0
-    return best_label, confidence
+    if not total:
+        return {}
+    return {label: (w / total) * 100 for label, w in weights.items()}
+
+
+def classify_knn(point_vec, training_X, training_y, k):
+    probs = classify_knn_probabilities(point_vec, training_X, training_y, k)
+    if not probs:
+        return None, 0.0
+    best_label = max(probs, key=probs.get)
+    return best_label, probs[best_label]
 
 
 def predict_series(model_info, physio, geology, x, y):
@@ -372,6 +613,23 @@ def predict_series(model_info, physio, geology, x, y):
     else:
         train_X, train_y = model
         return classify_knn(vec, train_X, train_y, KNN_NEIGHBOURS)
+
+
+def predict_series_probabilities(model_info, physio, geology, x, y):
+    """Full {series: probability %} distribution for one polygon, using
+    the same encoding/model as predict_series. Stage 1 uses it to rank
+    primary-driver candidates; the classifier's top series is its max."""
+    kind, model, physio_vocab, geology_vocab, coord_stats = model_info
+    vec = [1.0 if physio == p else 0.0 for p in physio_vocab]
+    vec += [1.0 if geology == g else 0.0 for g in geology_vocab]
+    vec += [(x - coord_stats["x_mean"]) / coord_stats["x_std"],
+            (y - coord_stats["y_mean"]) / coord_stats["y_std"]]
+
+    if kind == "random_forest":
+        proba = model.predict_proba([vec])[0]
+        return {str(c): float(p * 100) for c, p in zip(model.classes_, proba)}
+    train_X, train_y = model
+    return classify_knn_probabilities(vec, train_X, train_y, KNN_NEIGHBOURS)
 
 
 # ---- Tier 0: IDW from ground-truth points ----------------------------------
@@ -541,6 +799,11 @@ def run_pipeline():
     log(5, TOTAL_STEPS, "Decomposing existing MU codes / building training set...")
     rows, labels = build_training_set(joined, EXISTING_MU_FLD, NON_SOIL_CODES)
     print(f"  {len(rows)} verified polygons available for training")
+    evidence = build_series_evidence(
+        build_evidence_rows(joined, EXISTING_MU_FLD, NON_SOIL_CODES))
+    total_support = sum(e["support"] for e in evidence.values())
+    print(f"  Series-evidence table: {len(evidence)} series from "
+          f"{total_support} mapped polygons")
 
     log(6, TOTAL_STEPS, "Training & validating classifier...")
     model_info = None
@@ -582,8 +845,11 @@ def run_pipeline():
             continue  # leave non-soil polygons untouched
         else:
             centroid = feat.geometry().centroid().asPoint()
-            physio_val = feat[PHYSIO_NAME_FLD] if PHYSIO_NAME_FLD in feat.fields().names() else ""
-            geology_val = feat[GEOLOGY_NAME_FLD] if GEOLOGY_NAME_FLD in feat.fields().names() else ""
+            field_names = feat.fields().names()
+            physio_val = feat[PHYSIO_NAME_FLD] if PHYSIO_NAME_FLD in field_names else ""
+            geology_val = feat[GEOLOGY_NAME_FLD] if GEOLOGY_NAME_FLD in field_names else ""
+            known_depth = optional_field_value(feat, DEPTH_FLD)
+            known_slope = optional_field_value(feat, SLOPE_FLD)
 
             series, conf, method, flag = None, 0.0, "fallback", ""
             tier_comps = None  # components, when a tier supplies a full MU code
@@ -600,39 +866,85 @@ def run_pipeline():
                     tier_comps = decompose_mu(idw_mu)
                     series = tier_comps["SeriesCode"] if tier_comps else idw_mu
 
-            # Tier 1: classifier
-            if series is None and model_info:
-                pred_series, pred_conf = predict_series(
-                    model_info, physio_val, geology_val, centroid.x(), centroid.y()
+            # Stage 1: confirm the series from the PRIMARY drivers
+            # (geology + physiography + depth). The classifier works
+            # WITHIN the primary-driver evidence: its top series is
+            # accepted only when it is one of the evidence candidates;
+            # otherwise the top-ranked candidate wins.
+            if series is None:
+                probs = {}
+                pred_series, pred_conf = None, 0.0
+                if model_info:
+                    probs = predict_series_probabilities(
+                        model_info, physio_val, geology_val,
+                        centroid.x(), centroid.y()
+                    )
+                    if probs:
+                        pred_series = max(probs, key=probs.get)
+                        pred_conf = probs[pred_series]
+                candidates = rank_series_candidates(
+                    evidence, geology_val, physio_val,
+                    known_depth=known_depth or None,
+                    classifier_probs=probs or None,
                 )
-                if pred_conf >= CLASSIFIER_CONF_MIN:
+                candidate_series = {c["series"] for c in candidates}
+                if candidates and pred_series in candidate_series:
+                    series, conf, method = pred_series, pred_conf, "ml_classifier"
+                elif candidates:
+                    top = candidates[0]
+                    series, method = top["series"], "primary_driver_match"
+                    conf = primary_driver_confidence(
+                        top["depth_agreement"], top["support"], total_support
+                    )
+                    if pred_series is not None:
+                        flag = ("series set by primary-driver evidence "
+                                "over classifier")
+                elif (pred_series is not None
+                        and pred_conf >= CLASSIFIER_CONF_MIN):
+                    # No primary-driver evidence (unseen geology /
+                    # physiography combination): classifier alone.
                     series, conf, method = pred_series, pred_conf, "ml_classifier"
 
-            # Tier 2: rule-based
+            # Fallback: rule-based keyword matching
             if series is None:
                 rule_series, rule_conf = rule_based_match(physio_val, geology_val, SERIES_LOOKUP)
                 if rule_series:
                     series, conf, method = rule_series, rule_conf, "rule_based"
 
-            # Tier 3: nearest neighbour
+            # Fallback: nearest mapped polygon (series only - its
+            # components are completed in Stage 2 like every other
+            # Stage 1 path)
             if series is None:
                 nn_mu = nearest_neighbor_mu(feat.geometry(), mapped_index, mapped_lookup, joined)
                 if nn_mu:
-                    comps = decompose_mu(nn_mu)
-                    series = comps["SeriesCode"] if comps else nn_mu
+                    nn_comps = decompose_mu(nn_mu)
+                    series = nn_comps["SeriesCode"] if nn_comps else nn_mu
                     conf, method = 30.0, "nearest_neighbor"
 
-            # Tier 4: flagged default
+            # Last resort: flagged default
             if series is None:
                 series, conf, method = "UNK", 0.0, "fallback"
                 flag = "needs manual review - no evidence matched"
 
             if tier_comps is not None:
                 comps = tier_comps
+                mu_new = full_mu
+            elif method in ("primary_driver_match", "ml_classifier",
+                            "rule_based", "nearest_neighbor"):
+                # Stage 2: complete the mapping unit from the SECONDARY
+                # drivers - the confirmed series' modal components
+                # (same-physiography polygons preferred).
+                comps, mu_new, incomplete_note = apply_stage2(
+                    evidence, series, physio_val,
+                    known_depth=known_depth, slope_code=known_slope,
+                )
+                if incomplete_note:
+                    flag = (f"{flag}; {incomplete_note}" if flag
+                            else incomplete_note)
             else:
                 comps = {"SeriesCode": series, "DepthNum": "", "SurTexCode": "",
                          "SlopeCode": "", "ErosionNum": ""}
-            mu_new = full_mu if full_mu is not None else series
+                mu_new = series
 
         method_counts[method] += 1
         if method != "existing":
