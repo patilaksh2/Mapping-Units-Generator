@@ -1,13 +1,13 @@
 # Soil Mapping Unit (MU) Generator
 
-A QGIS Python console script that automates assignment of **Soil Mapping Units (MU)** to survey polygons for semi-detailed soil surveys, using a hybrid pipeline of ground-truth interpolation, a trained classifier, rule-based physiography/geology matching, and nearest-neighbour fallback — validated at every stage before it's trusted.
+A QGIS Python console script that automates assignment of **Soil Mapping Units (MU)** to survey polygons for semi-detailed soil surveys, using a hybrid pipeline of ground-truth interpolation, a trained classifier, rule-based physiography/geology matching, and nearest-neighbour fallback — with classifier accuracy measured (stratified holdout + k-fold cross-validation) and reported on every run.
 
 ## What it does
 
 Given a soil survey polygon layer where **some** polygons already carry a surveyor-verified Mapping Unit and others are still blank, the script fills in the blanks using a decision hierarchy that mirrors how a surveyor would actually reason:
 
 1. **Ground-truth field points (highest authority)** — IDW-weighted spatial interpolation from real point observations within a search radius; auto-accepted above a confidence threshold.
-2. **Supervised classifier** — trained on the polygons that already have a valid MU (physiography + geology + location → series). Uses a Random Forest if `scikit-learn`/`numpy` are available — validated with a stratified holdout and stratified k-fold cross-validation before use — otherwise falls back to a pure-Python weighted k-NN. Its prediction is checked against the primary-driver evidence table (see *Method* below).
+2. **Supervised classifier** — trained on the polygons that already have a valid MU (physiography + geology + location → series). Uses a Random Forest if `scikit-learn`/`numpy` are available — validated with a stratified holdout and stratified k-fold cross-validation (the scores are reported, but do not gate assignment) — otherwise falls back to a pure-Python weighted k-NN. Its prediction is checked against the primary-driver evidence table (see *Method* below).
 3. **Rule-based physiography/geology keyword matching** — used when neither the evidence table nor the classifier produces a series.
 4. **Nearest mapped polygon** — last resort before an explicitly flagged default.
 
@@ -17,7 +17,7 @@ Every prediction is tagged with *how* it was decided (`MU_Method`), a confidence
 
 Assignment follows the two-stage driver hierarchy used in SLUSI-style soil survey — the **primary drivers confirm the soil series first**; only then do the **secondary drivers complete the mapping unit**.
 
-**Stage 1 — confirm the series (primary drivers: Geology, Physiography, Depth).** From the already-mapped polygons the script builds a *series-evidence table*: for every series, the geology values and physiography values it occurs with, its depth-class distribution, its polygon count (support), and its modal MU components. For an unmapped polygon, candidate series are those whose observed geology **and** physiography both match the polygon's joined values. Candidates are ranked by (1) depth agreement — the share of the candidate's polygons carrying the polygon's depth class when a depth field is configured (`DEPTH_FLD`), otherwise the share carrying the candidate's modal depth class; (2) the classifier's probability for that series; (3) support. The trained classifier (Random Forest / k-NN) still predicts a series, but it operates *within* this evidence: if its top series is among the candidates it is accepted (`ml_classifier`); if candidates exist but the classifier's pick is not one of them, the top-ranked candidate wins (`primary_driver_match`, confidence = 50 + 30 × depth-agreement share + 20 × relative support) and the polygon is flagged "series set by primary-driver evidence over classifier". Only when the candidate set is empty (an unseen geology/physiography combination) does the pipeline fall through to the classifier alone (if it clears `CLASSIFIER_CONF_MIN`), then keyword rules, then the nearest mapped polygon, then the flagged `UNK` default. Tier 0 (IDW from ground-truth points, which returns a complete MU code) stays above Stage 1 as direct field evidence.
+**Stage 1 — confirm the series (primary drivers: Geology, Physiography, Depth).** From the already-mapped polygons the script builds a *series-evidence table*: for every series, the geology values and physiography values it occurs with, its depth-class distribution, its polygon count (support), and its modal MU components. For an unmapped polygon, candidate series are those whose observed geology **and** physiography both match the polygon's joined values. Candidates are ranked by (1) the depth term — when a depth field is configured (`DEPTH_FLD`), true *depth agreement*: the share of the candidate's polygons carrying the polygon's own depth class; when `DEPTH_FLD` is not set, a *depth-concentration weight*: the share of the candidate series' mapped polygons that sit at its modal depth class, which measures how depth-consistent the series itself is rather than agreement with this polygon; (2) the classifier's probability for that series; (3) support. The trained classifier (Random Forest / k-NN) still predicts a series, but it operates *within* this evidence: if its top series is among the candidates it is accepted (`ml_classifier`); if candidates exist but the classifier's pick is not one of them, the top-ranked candidate wins (`primary_driver_match`, score = 50 + 30 × depth-term share + 20 × relative support) and the polygon is flagged "series set by primary-driver evidence over classifier". Only when the candidate set is empty (an unseen geology/physiography combination) does the pipeline fall through to the classifier alone (if it clears `CLASSIFIER_CONF_MIN`), then keyword rules, then the nearest mapped polygon, then the flagged `UNK` default. Tier 0 (IDW from ground-truth points, which returns a complete MU code) stays above Stage 1 as direct field evidence. One deliberate design rule: when the classifier's top series is inside the candidate set, it is accepted at its model probability **without** the `CLASSIFIER_CONF_MIN` gate — membership in the primary-driver evidence is itself the gate. `CLASSIFIER_CONF_MIN` applies only on the no-candidate path, where the classifier stands alone.
 
 **Stage 2 — complete the mapping unit (secondary drivers).** Once the series is fixed, `DepthNum`, `SurTexCode`, `SlopeCode` and `ErosionNum` are filled from the evidence table's modal component values for that series — preferring polygons in the same physiography, falling back to series-wide modal values. A configured `DEPTH_FLD` value supplies the depth class, and `SLOPE_FLD` the slope code, when populated. `MU_New` is then assembled as the full code `Series + Depth + SurfaceTex + Slope + Erosion`. A component with no modal value anywhere is left blank and flagged (`MU incomplete: <component> unknown`) — values are never invented.
 
@@ -39,7 +39,7 @@ This example format is illustrative — your own series-code scheme will differ 
 | 2 | Load ground-truth point layers for IDW (Tier 0 evidence) |
 | 3 | Spatial join: soil ← physiography (largest overlap) |
 | 4 | Spatial join: result ← geology (largest overlap) |
-| 5 | Disintegrate existing MU codes & build the training set |
+| 5 | Decompose existing MU codes & build the training set |
 | 6 | Train & validate the supervised classifier (stratified holdout, stratified k-fold CV, confusion matrix, feature importance) |
 | 7 | Assign series to unmapped polygons (two-stage: primary-driver evidence + classifier confirm the series, then Stage 2 completes the MU) |
 | 8 | Flag adjacency conflicts — touching polygons that share an identical MU are flagged for manual review (MU codes are never altered) |
@@ -72,7 +72,7 @@ The script expects, at minimum:
 4. Update the paths and field names in the **Configuration** section at the top (see below).
 5. Click **▶ Run**.
 
-Progress and a full summary report (MU counts, assignment-method breakdown, confidence distribution, and any flags needing review) print to the console.
+Progress and a full summary report (MU counts, assignment-method breakdown, mean confidence, and any flags needing review) print to the console.
 
 ## Configuration
 
@@ -95,7 +95,7 @@ An output shapefile with new fields:
 | `SeriesCode`, `DepthNum`, `SurTexCode`, `SlopeCode`, `ErosionNum` | Decomposed MU components |
 | `MU_New` | Final assembled MU code |
 | `MU_Source` | `existing` or `predicted` |
-| `MU_Conf` | Confidence % (predicted polygons only) |
+| `MU_Conf` | Heuristic confidence **score** (0–100) — *not* a calibrated probability. Existing polygons carry 100. For predicted polygons the value's meaning depends on the method (a model probability, an IDW vote share, or a heuristic formula value), so scores are not strictly comparable across methods |
 | `MU_Method` | `idw_ground_truth`, `primary_driver_match`, `ml_classifier`, `rule_based`, `nearest_neighbor`, or `fallback` |
 | `MU_Flag` | Anything flagged for manual review |
 
@@ -104,6 +104,10 @@ An output shapefile with new fields:
 - Requires the QGIS Python environment; won't run in plain Python.
 - Non-soil polygons (habitation, water bodies) are excluded from classification via a configurable exclusion list.
 - The series lookup table is region-specific by design. Adapting this script to a new survey area means rebuilding that table for local series names/codes.
+- Validation is random, not spatial: the classifier's holdout / k-fold splits are stratified but random, so neighbouring polygons of the same series appear on both sides of every split. Under spatial autocorrelation the printed accuracy is optimistic — treat it as an upper bound, not field accuracy.
+- Coordinates are classifier features: the polygon centroid (x, y) is part of the model input, so part of what the classifier learns is *where* each series occurs, not only transferable landscape (geology/physiography) relationships. Performance may not carry over to a new sheet or area.
+- Stage 2 homogenises within-series variation: modal imputation gives every predicted polygon of a series (within a physiography) the same texture/slope/erosion, erasing real variation within the series.
+- Driver matching is literal: candidate matching compares the joined geology/physiography names exactly, so inconsistent naming between layers (synonyms, case differences, spacing) yields no candidates and the polygon falls back to the lower tiers.
 
 ## License
 
