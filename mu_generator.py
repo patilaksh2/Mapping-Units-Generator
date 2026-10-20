@@ -19,6 +19,7 @@ logic beneath it should not need editing for normal use.
 
 import math
 import random
+import re
 import statistics
 from collections import Counter, defaultdict
 
@@ -107,8 +108,14 @@ IDW_POWER             = 2.0     # inverse-distance weighting power
 IDW_CONFIDENCE_MIN    = 80.0    # % - auto-accept IDW result above this
 CLASSIFIER_CONF_MIN   = 60.0    # % - accept classifier result above this
 KNN_NEIGHBOURS        = 5
-SPATIAL_BLOCK_CV_SIZE = 5       # number of spatial blocks for block CV
 RANDOM_SEED           = 42
+
+# Optional local overrides: if an untracked config.py sits next to this
+# script (see config.py.example), its values replace the defaults above.
+try:
+    from config import *  # noqa: F401,F403
+except ImportError:
+    pass
 
 random.seed(RANDOM_SEED)
 if HAVE_NUMPY:
@@ -175,7 +182,7 @@ def spatial_join_largest_overlap(base_layer, join_layer, join_field, output_fiel
             "JOIN": join_layer,
             "PREDICATE": [0],  # intersects
             "JOIN_FIELDS": [join_field],
-            "METHOD": 0,       # take attributes of the feature with the largest overlap
+            "METHOD": 2,       # largest overlap only (2); 0 is one-to-many and duplicates features
             "DISCARD_NONMATCHING": False,
             "PREFIX": "",
             "OUTPUT": "memory:",
@@ -188,24 +195,26 @@ def spatial_join_largest_overlap(base_layer, join_layer, join_field, output_fiel
 
 def decompose_mu(mu_code):
     """
-    Split a composite MU code into its components. This parser assumes the
-    SeriesCode+DepthNum+SurfaceTexCode+SlopeCode+ErosionNum convention
-    described in the README - adjust the parsing rule if your own MU code
-    convention differs.
+    Split a composite MU code into its components, following the grammar
+    described in the README:
+
+        SeriesCode(2 letters) + DepthNum(1 digit) + SurfaceTexCode(1 letter)
+        + SlopeCode(1 letter) + ErosionNum(1 digit)      e.g. "AD3rB2"
+
+    Returns None if the code is empty or does not match that grammar -
+    adjust the pattern if your own MU code convention differs.
     """
     if not mu_code:
         return None
-    mu_code = str(mu_code).strip()
-    letters = "".join(c for c in mu_code if c.isalpha())
-    digits = "".join(c for c in mu_code if c.isdigit())
-    series = letters[:2] if len(letters) >= 2 else letters
-    depth = digits[0] if len(digits) >= 1 else ""
-    slope = letters[2:3] if len(letters) >= 3 else ""
-    erosion = digits[1] if len(digits) >= 2 else ""
+    m = re.match(r"^([A-Za-z]{2})(\d)([A-Za-z])([A-Za-z])(\d)$",
+                 str(mu_code).strip())
+    if not m:
+        return None
+    series, depth, sur_tex, slope, erosion = m.groups()
     return {
         "SeriesCode": series,
         "DepthNum": depth,
-        "SurTexCode": letters[len(series):len(series) + 1],
+        "SurTexCode": sur_tex,
         "SlopeCode": slope,
         "ErosionNum": erosion,
     }
@@ -236,13 +245,16 @@ def build_training_set(layer, existing_mu_fld, non_soil_codes):
 
 # ---- Feature encoding for the classifier -----------------------------------
 
-def encode_features(rows, physio_vocab, geology_vocab):
-    """One-hot-ish encode physiography/geology + normalised coordinates."""
+def encode_features(rows, physio_vocab, geology_vocab, coord_stats):
+    """One-hot-ish encode physiography/geology + z-score normalised
+    coordinates (using the training set's mean/std in coord_stats, so the
+    raw UTM magnitudes don't dominate distance-based models like k-NN)."""
     encoded = []
     for r in rows:
         vec = [1.0 if r["physio"] == p else 0.0 for p in physio_vocab]
         vec += [1.0 if r["geology"] == g else 0.0 for g in geology_vocab]
-        vec += [r["x"], r["y"]]
+        vec += [(r["x"] - coord_stats["x_mean"]) / coord_stats["x_std"],
+                (r["y"] - coord_stats["y_mean"]) / coord_stats["y_std"]]
         encoded.append(vec)
     return encoded
 
@@ -252,7 +264,15 @@ def encode_features(rows, physio_vocab, geology_vocab):
 def train_classifier(rows, labels):
     physio_vocab = sorted({r["physio"] for r in rows})
     geology_vocab = sorted({r["geology"] for r in rows})
-    X = encode_features(rows, physio_vocab, geology_vocab)
+    xs = [r["x"] for r in rows]
+    ys = [r["y"] for r in rows]
+    coord_stats = {
+        "x_mean": statistics.mean(xs),
+        "x_std": statistics.pstdev(xs) or 1.0,
+        "y_mean": statistics.mean(ys),
+        "y_std": statistics.pstdev(ys) or 1.0,
+    }
+    X = encode_features(rows, physio_vocab, geology_vocab, coord_stats)
     y = labels
 
     class_counts = Counter(y)
@@ -303,17 +323,21 @@ def train_classifier(rows, labels):
         # Confusion matrix + feature importance
         cm = confusion_matrix(y_test, clf.predict(X_test), labels=sorted(class_counts))
         print(f"  Confusion matrix (labels={sorted(class_counts)}):\n{cm}")
+        feature_names = ([f"physio:{p}" for p in physio_vocab]
+                         + [f"geology:{g}" for g in geology_vocab]
+                         + ["x", "y"])
         top_features = np.argsort(clf.feature_importances_)[::-1][:5]
-        print(f"  Top feature indices by importance: {list(top_features)}")
+        print(f"  Top features by importance: "
+              f"{[feature_names[i] for i in top_features]}")
 
         # Retrain on all data for final model
         clf.fit(X_arr, y_arr)
-        return ("random_forest", clf, physio_vocab, geology_vocab)
+        return ("random_forest", clf, physio_vocab, geology_vocab, coord_stats)
 
     else:
         print("  numpy/scikit-learn not available (or too few samples) - "
               "using pure-Python weighted k-NN instead")
-        return ("knn", (X, y), physio_vocab, geology_vocab)
+        return ("knn", (X, y), physio_vocab, geology_vocab, coord_stats)
 
 
 def classify_knn(point_vec, training_X, training_y, k):
@@ -334,10 +358,11 @@ def classify_knn(point_vec, training_X, training_y, k):
 
 
 def predict_series(model_info, physio, geology, x, y):
-    kind, model, physio_vocab, geology_vocab = model_info
+    kind, model, physio_vocab, geology_vocab, coord_stats = model_info
     vec = [1.0 if physio == p else 0.0 for p in physio_vocab]
     vec += [1.0 if geology == g else 0.0 for g in geology_vocab]
-    vec += [x, y]
+    vec += [(x - coord_stats["x_mean"]) / coord_stats["x_std"],
+            (y - coord_stats["y_mean"]) / coord_stats["y_std"]]
 
     if kind == "random_forest":
         proba = model.predict_proba([vec])[0]
@@ -351,10 +376,16 @@ def predict_series(model_info, physio, geology, x, y):
 
 # ---- Tier 0: IDW from ground-truth points ----------------------------------
 
-def load_ground_truth_points(paths, mu_field):
+def load_ground_truth_points(paths, mu_field, target_crs=TARGET_CRS):
     points = []
     for p in paths:
-        layer = load_layer(p, "ground_truth")
+        layer = fix_geometry_and_reproject(load_layer(p, "ground_truth"),
+                                           target_crs)
+        if layer.crs().authid() != target_crs:
+            raise RuntimeError(
+                f"Ground-truth layer '{p}' is in {layer.crs().authid()}, "
+                f"expected {target_crs}"
+            )
         for feat in layer.getFeatures():
             mu = feat[mu_field]
             if not mu:
@@ -422,10 +453,19 @@ def nearest_neighbor_mu(geom, index, lookup, layer):
 
 # ---- Step 8: adjacency conflict resolution ----------------------------------
 
-def resolve_adjacency_conflicts(layer, mu_field, source_field):
+def resolve_adjacency_conflicts(layer, mu_field, source_field,
+                                flag_field="MU_Flag"):
     """
-    Ensures no two touching polygons share an identical MU, unless both are
-    surveyor-verified ('existing') - those are never altered.
+    Flag - but never alter - polygons whose MU clashes with a touching
+    neighbour. Two touching polygons sharing an identical MU is not
+    automatically an error in soil mapping, so this never edits MU codes:
+    where two touching polygons share the same MU and neither is
+    surveyor-verified ('existing'), it writes a note into the flag field
+    for manual review instead. Surveyor-verified polygons are never
+    flagged. Returns the number of polygons flagged.
+
+    All conflicts are collected from the unedited layer first, so edits
+    applied here can never influence which polygons get flagged.
     """
     features = list(layer.getFeatures())
     index = QgsSpatialIndex()
@@ -433,8 +473,9 @@ def resolve_adjacency_conflicts(layer, mu_field, source_field):
         index.addFeature(f)
 
     by_id = {f.id(): f for f in features}
-    flagged = 0
+    flag_idx = layer.fields().indexFromName(flag_field)
 
+    to_flag = set()
     for f in features:
         if f[source_field] == "existing":
             continue
@@ -443,20 +484,25 @@ def resolve_adjacency_conflicts(layer, mu_field, source_field):
             if nid == f.id():
                 continue
             other = by_id[nid]
-            if other[mu_field] == f[mu_field] and f.geometry().touches(other.geometry()):
-                if other[source_field] == "existing":
-                    continue  # never override a surveyor-verified polygon
-                # nudge the erosion digit to break the tie, flag for review
-                mu = str(f[mu_field])
-                if mu and mu[-1].isdigit():
-                    bumped = mu[:-1] + str((int(mu[-1]) + 1) % 10)
-                else:
-                    bumped = mu + "1"
+            if other[source_field] == "existing":
+                continue
+            if (other[mu_field] == f[mu_field]
+                    and f.geometry().touches(other.geometry())):
+                to_flag.add(f.id())
+                break
+
+    msg = ("adjacency conflict: shares MU with a neighbouring polygon "
+           "- manual review")
+    for fid in to_flag:
+        existing_flag = by_id[fid][flag_field]
+        if existing_flag:
+            if msg not in existing_flag:
                 layer.changeAttributeValue(
-                    f.id(), layer.fields().indexFromName(mu_field), bumped
+                    fid, flag_idx, safe_str(f"{existing_flag}; {msg}", 100)
                 )
-                flagged += 1
-    return flagged
+        else:
+            layer.changeAttributeValue(fid, flag_idx, msg)
+    return len(to_flag)
 
 
 # ---- Main pipeline -----------------------------------------------------------
@@ -469,11 +515,21 @@ def run_pipeline():
     physio = load_layer(PHYSIO_LAYER, "physiography")
     geology = load_layer(GEOLOGY_LAYER, "geology")
     soil = fix_geometry_and_reproject(soil, TARGET_CRS)
+    physio = fix_geometry_and_reproject(physio, TARGET_CRS)
+    geology = fix_geometry_and_reproject(geology, TARGET_CRS)
+    for layer_name, layer in (("soil", soil), ("physiography", physio),
+                              ("geology", geology)):
+        if layer.crs().authid() != TARGET_CRS:
+            raise RuntimeError(
+                f"Layer '{layer_name}' is in {layer.crs().authid()}, "
+                f"expected {TARGET_CRS}"
+            )
 
     log(1, TOTAL_STEPS, "Layers loaded.")
 
     log(2, TOTAL_STEPS, "Loading ground-truth points for IDW...")
-    gt_points = load_ground_truth_points(GROUND_TRUTH_POINT_LAYERS, POINT_MU_FLD)
+    gt_points = load_ground_truth_points(GROUND_TRUTH_POINT_LAYERS,
+                                         POINT_MU_FLD, TARGET_CRS)
     print(f"  Loaded {len(gt_points)} ground-truth points")
 
     log(3, TOTAL_STEPS, "Spatial join: soil <- physiography...")
@@ -511,13 +567,18 @@ def run_pipeline():
 
     joined.startEditing()
     for feat in joined.getFeatures():
-        existing_mu = feat[EXISTING_MU_FLD]
+        raw_mu = feat[EXISTING_MU_FLD]
+        existing_mu = str(raw_mu).strip() if raw_mu else ""
 
-        if existing_mu and str(existing_mu).strip().upper() not in NON_SOIL_CODES:
+        if existing_mu and existing_mu.upper() not in NON_SOIL_CODES:
             comps = decompose_mu(existing_mu)
             method, conf, flag = "existing", 100.0, ""
-            mu_new = str(existing_mu)
-        elif existing_mu and str(existing_mu).strip().upper() in NON_SOIL_CODES:
+            if comps is None:
+                comps = {"SeriesCode": "", "DepthNum": "", "SurTexCode": "",
+                         "SlopeCode": "", "ErosionNum": ""}
+                flag = "existing MU code does not match the expected format"
+            mu_new = existing_mu
+        elif existing_mu and existing_mu.upper() in NON_SOIL_CODES:
             continue  # leave non-soil polygons untouched
         else:
             centroid = feat.geometry().centroid().asPoint()
@@ -525,14 +586,19 @@ def run_pipeline():
             geology_val = feat[GEOLOGY_NAME_FLD] if GEOLOGY_NAME_FLD in feat.fields().names() else ""
 
             series, conf, method, flag = None, 0.0, "fallback", ""
+            tier_comps = None  # components, when a tier supplies a full MU code
+            full_mu = None     # full MU code, when a tier supplies one
 
-            # Tier 0: IDW
+            # Tier 0: IDW (yields a full MU code from the ground-truth point)
             if gt_points:
                 idw_mu, idw_conf = idw_predict(
                     centroid.x(), centroid.y(), gt_points, IDW_SEARCH_RADIUS_M, IDW_POWER
                 )
                 if idw_mu and idw_conf >= IDW_CONFIDENCE_MIN:
-                    series, conf, method = idw_mu, idw_conf, "idw_ground_truth"
+                    conf, method = idw_conf, "idw_ground_truth"
+                    full_mu = idw_mu
+                    tier_comps = decompose_mu(idw_mu)
+                    series = tier_comps["SeriesCode"] if tier_comps else idw_mu
 
             # Tier 1: classifier
             if series is None and model_info:
@@ -561,9 +627,12 @@ def run_pipeline():
                 series, conf, method = "UNK", 0.0, "fallback"
                 flag = "needs manual review - no evidence matched"
 
-            comps = {"SeriesCode": series, "DepthNum": "", "SurTexCode": "",
-                     "SlopeCode": "", "ErosionNum": ""}
-            mu_new = series
+            if tier_comps is not None:
+                comps = tier_comps
+            else:
+                comps = {"SeriesCode": series, "DepthNum": "", "SurTexCode": "",
+                         "SlopeCode": "", "ErosionNum": ""}
+            mu_new = full_mu if full_mu is not None else series
 
         method_counts[method] += 1
         if method != "existing":
@@ -592,11 +661,11 @@ def run_pipeline():
 
     joined.commitChanges()
 
-    log(8, TOTAL_STEPS, "Resolving adjacency conflicts...")
+    log(8, TOTAL_STEPS, "Flagging adjacency conflicts...")
     joined.startEditing()
     flagged = resolve_adjacency_conflicts(joined, "MU_New", "MU_Source")
     joined.commitChanges()
-    print(f"  {flagged} polygons adjusted to resolve adjacency conflicts")
+    print(f"  {flagged} polygons flagged for adjacency conflicts")
 
     log(9, TOTAL_STEPS, "Saving output shapefile...")
     error = QgsVectorFileWriter.writeAsVectorFormat(
